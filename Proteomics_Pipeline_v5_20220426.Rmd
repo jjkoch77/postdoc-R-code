@@ -1,0 +1,387 @@
+---
+title: "Proteomics Analysis using DEqMS"
+authors: "Joe Kochmanski"
+date: "4/26/2022"
+output: html_document
+---
+
+
+```{r Load bioconductor and packages}
+
+####################### Proteomics analysis ###########################
+
+#Note: some specialty packages are only available through Bioconductor
+## try http:// if https:// URLs are not supported
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager") 
+BiocManager::install(version = "3.14")#Installs bioconductor
+
+BiocManager::install("DEqMS") #Install DEqMS package 
+
+#Load required DEqMS package:
+library(DEqMS) #Load installed package
+```
+
+```{r Read in dataset}
+#Let's adapt the pipeline provided in the DEqMS documentation to real data.
+
+## ----Read in protein abundance table---------------------------------------------------------------
+df.prot = read.table("/Users/JoeKochmanski/Dropbox/Bernstein_Lab/Gloria_Rotation_Proteomics/220219-Gloria-LFQ_Proteins.txt",header=T,sep="\t")
+head(df.prot)
+
+# remove decoy matches and matches to contaminant - not always relevant.
+#df.prot = df.prot[!df.prot$Reverse=="+",]
+#df.prot = df.prot[!df.prot$Contaminant=="+",]
+
+# Extract columns of LFQ intensities
+df.LFQ = df.prot[,51:58] #Adjust column index as needed.
+df.LFQ[df.LFQ==0] <- NA
+
+#Rename rows of data frame:
+rownames(df.LFQ) = df.prot$Accession
+#Count NA values in each group
+df.LFQ$na_count_A = apply(df.LFQ,1,function(x) sum(is.na(x[1:2])))
+df.LFQ$na_count_B = apply(df.LFQ,1,function(x) sum(is.na(x[3:4])))
+df.LFQ$na_count_C = apply(df.LFQ,1,function(x) sum(is.na(x[5:6])))
+df.LFQ$na_count_D = apply(df.LFQ,1,function(x) sum(is.na(x[7:8])))
+df.LFQ$na_count_A #View na count table produced by code above.
+df.LFQ$na_count_B #View na count table produced by code above.
+df.LFQ$na_count_C #View na count table produced by code above.
+df.LFQ$na_count_D #View na count table produced by code above.
+
+# Filter protein table by NA count variables. DEqMS require minimum one values for each group.
+#Two ways to do this:
+df.LFQ.filter = df.LFQ[df.LFQ$na_count_A<1 & df.LFQ$na_count_B<1 & df.LFQ$na_count_C<1 & df.LFQ$na_count_D<1,1:8]
+df.LFQ.filter2 = df.LFQ[complete.cases(df.LFQ),]
+```
+
+```{r Generate count table for downstream modeling}
+## ----pepCountTable------------------------------------------------------------
+library(matrixStats)
+
+#NOTE: Need to add count variable to run the spectraCounteBayes test below.
+df.prot$unique.and.razor.peptides <- df.prot$Number.of.Unique.Peptides + df.prot$Number.of.Razor.Peptides
+
+# we use minimum peptide count among six samples
+# count unique+razor peptides used for quantification
+pep.count.table = data.frame(count = as.matrix(df.prot$unique.and.razor.peptides),
+                             row.names = df.prot$Accession)
+head(pep.count.table)
+
+#Check minimum value of counts
+min(df.prot$unique.and.razor.peptides)
+# 1
+
+# Minimum peptide count of some proteins can be 0 (but is not in our data)
+# If needed, can add pseudocount 1 to all proteins:
+#pep.count.table$count = pep.count.table$count+1
+#head(pep.count.table)
+```
+
+```{r Create modeling matrix and fit models}
+
+## ----labelfreeDEqMS-----------------------------------------------------------
+protein.matrix = log2(as.matrix(df.LFQ.filter))
+
+class = as.factor(c("A","A","B","B","C","C","D","D"))
+design = model.matrix(~0+class) # fitting without intercept
+
+#Notes: Group A = PFF, injected (ipsilateral)
+#Group B = PFF, non-injected (contralateral)
+#Group C = PBS, injected (ipsilateral)
+#Group D = PBS, non-injected (contralateral)
+
+design#view design matrix for modeling.
+    #classA classB classC classD
+#1      1      0      0      0
+#2      1      0      0      0
+#3      0      1      0      0
+#4      0      1      0      0
+#5      0      0      1      0
+#6      0      0      1      0
+#7      0      0      0      1
+#8      0      0      0      1
+
+#First, let's compare groups A and C:
+fit1 = lmFit(protein.matrix,design = design)
+#Now let's specify which contrasts we want to compare -- in this case, groups A and C:
+cont <- makeContrasts(classA-classC, levels = design)
+fit2 = contrasts.fit(fit1,contrasts = cont) #specify contrasts for modeling
+fit3 <- eBayes(fit2) #Now lets use Bayesian statistics to stabilize variance.
+
+fit3$coefficients #view to coefficients for each protein accession to assess model fitting
+
+#Need to add count variable to fit to run the spectraCounteBayes test below:
+fit3$count = pep.count.table[rownames(fit3$coefficients),"count"]
+
+#check the values in the vector fit3$count to see if there are any NAs or 0, which there shouldn't be,
+#though this is not relevant since we didn't add the count variable.
+#if min(fit3$count) return NA or 0, you should troubleshoot the error first
+min(fit3$count)
+
+head(fit3)
+
+#NOTE: Need to generate count variable to run the function below:
+
+fit4 = spectraCounteBayes(fit3)
+```
+
+```{r Create boxplot of peptide count}
+## ----LFQboxplot---------------------------------------------------------------
+VarianceBoxplot(fit4, n=20, main = "Label-free dataset",
+                xlab="unique + razor peptide count")
+```
+
+```{r Examine modeling results}
+## ----LFQresult----------------------------------------------------------------
+DEqMS.results = outputResult(fit4,coef_col = 1)
+# Add Gene names and ensembl IDs to the data frame
+rownames(df.prot) = df.prot$Accession
+DEqMS.results$Gene.Symbol = df.prot[DEqMS.results$gene,]$Gene.Symbol
+DEqMS.results$Ensembl.Gene.ID = df.prot[DEqMS.results$gene,]$Ensembl.Gene.ID
+head(DEqMS.results)
+```
+
+```{r Write table of modeling results}
+#Write table of results:
+write.table(DEqMS.results,"/Users/jjkoch/Dropbox/Bernstein_Lab/Gloria_Rotation_Proteomics/A-C.Gloria.Proteomics.DEqMS.result_20220225.txt",sep = "\t",
+            row.names = F,quote=F)
+```
+
+```{r Generate volcano plot of modeling results}
+## ----Make volcanoplot----------------------------------------------------------------
+#We recommend to plot p-values on y-axis instead of adjusted pvalue or FDR.
+
+library(ggrepel)
+# Use ggplot2 allows more flexibility in plotting
+
+DEqMS.results$log.sca.pval = -log10(DEqMS.results$sca.P.Value)
+ggplot(DEqMS.results, aes(x = logFC, y =log.sca.pval )) + 
+  geom_point(size=0.5 )+
+  theme_bw(base_size = 16) + # change theme
+  xlab(expression("log2 fold change")) + # x-axis label
+  ylab(expression(" -log10(P-value)")) + # y-axis label
+  geom_vline(xintercept = c(-1,1), colour = "red") + # Add fold change cutoffs
+  geom_hline(yintercept = 3, colour = "red") + # Add significance cutoffs
+  geom_vline(xintercept = 0, colour = "black") + # Add 0 lines
+  scale_colour_gradient(low = "black", high = "black", guide = FALSE)+
+  geom_text_repel(data=subset(DEqMS.results, abs(logFC)>1&log.sca.pval > 3),
+                  aes( logFC, log.sca.pval ,label=Gene.Symbol)) # add gene label
+## Warning: It is deprecated to specify `guide = FALSE` to remove a guide. Please
+## use `guide = "none"` instead.
+```
+
+```{r Filter results by adjusted p-values and write table}
+## ---- Filter results by adjusted p-values -----------------------
+
+DEqMS.results.filter <- DEqMS.results[which(DEqMS.results$adj.P.Val<0.05),]
+#88 proteins with adjusted p-value < 0.05
+
+write.csv(DEqMS.results.filter, "/Users/jjkoch/Dropbox/Bernstein_Lab/Gloria_Rotation_Proteomics/A-C.Gloria.Proteomics.DEqMS.result_20220225.csv")
+```
+
+```{r Optional: Can also order or split results by cirection of effect}
+
+#Can also order results by logFC direction
+DEqMS.results.filter.order <-  DEqMS.results.filter[order(DEqMS.results.filter$logFC),]
+
+#Alternatively, can split by positive/negative logFC:
+DEqMS.results.filter.up <- DEqMS.results.filter[which(DEqMS.results.filter$logFC>0),]
+#45 proteins with increased expression in A compared to C
+DEqMS.results.filter.down <- DEqMS.results.filter[which(DEqMS.results.filter$logFC<0),]
+#43 proteins with decreased expression in A compared to C
+
+#Now let's write out these results:
+write.csv(DEqMS.results.filter.up, "/Users/JoeKochmanski/Dropbox/Bernstein_Lab/Gloria_Rotation_Proteomics/A-C.Gloria.Proteomics.DEqMS.result.up_20220225.csv")
+write.csv(DEqMS.results.filter.down, "/Users/JoeKochmanski/Dropbox/Bernstein_Lab/Gloria_Rotation_Proteomics/A-C.Gloria.Proteomics.DEqMS.result.down_20220225.csv")
+
+############# END OF DIFFERENTIAL TESTING ##############
+```
+
+
+######## ------------ Hypergeometric test for pathway enrichment ------------ #######
+
+```{r Use clusterProfiler to perform hypergeometric test for pathway enrichment}
+#Let's use clusterProfiler to perform pathway analysis on differential proteins.
+
+#ClusterProfiler for GO enrichment for RNA-seq data:
+
+BiocManager::install("clusterProfiler")
+BiocManager::install("pathview")
+BiocManager::install("enrichplot")
+BiocManager::install("AnnotationDbi")
+BiocManager::install("ggnewscale")
+library(tidyr)
+library(clusterProfiler)
+library(enrichplot)
+library(AnnotationDbi)
+# we use ggplot2 to add x axis labels (ex: ridgeplot)
+library(ggplot2)
+library(ggnewscale)
+
+#Load rat database
+organism = "org.Rn.eg.db" #Creates object for correct database name.
+
+BiocManager::install(organism, character.only = TRUE)
+library(organism, character.only = TRUE) #Installs rat annotation database
+## We will run enrichment analysis on shared list of hits from male AND female rat brains:
+
+#View the keytypes available in rat organism database
+keytypes(org.Rn.eg.db)
+#x <- org.Rn.egENSEMBL
+x <- org.Rn.egSYMBOL
+# Get the entrez gene IDs that are mapped to an Ensembl ID
+mapped_genes <- mappedkeys(x)
+# Convert to a list
+xx <- as.list(x[mapped_genes])
+if(length(xx) > 0) {
+  # Get the Ensembl gene IDs for the first five genes
+  xx[1:5]
+  # Get the first one
+  xx[[1]]
+}
+
+```
+
+```{r Read in the differential testing data, as well as background testing data (universe)}
+
+#First, we need to read in the data:
+DEqMS.results.filter <- read.csv("/Users/jjkoch/Dropbox/Bernstein_Lab/Gloria_Rotation_Proteomics/A-C.Gloria.Proteomics.DEqMS.result_20220225.csv")
+#DEqMS.results.filter.up <- read.csv("/Users/jjkoch/Dropbox/Bernstein_Lab/Gloria_Rotation_Proteomics/A-C.Gloria.Proteomics.DEqMS.result.up_20220225.csv")
+#DEqMS.results.filter.down <- read.csv("/Users/jjkoch/Dropbox/Bernstein_Lab/Gloria_Rotation_Proteomics/A-C.Gloria.Proteomics.DEqMS.result.down_20220225.csv")
+
+#Also need to read in full test table of all proteins that were analyzed to use as a background for enrichment testing:
+df0 <- DEqMS.results.filter
+df0.full <- read.table("/Users/jjkoch/Dropbox/Bernstein_Lab/Gloria_Rotation_Proteomics/A-C.Gloria.Proteomics.DEqMS.result_20220225.txt",sep = "\t", header=TRUE)
+```
+
+```{r Generate data frames containing lists of proteins}
+# omit any rows with NA value for Gene Symbol
+df0$Gene.Symbol <- replace(df0$Gene.Symbol, df0$Gene.Symbol == "", NA)
+df0.full$Gene.Symbol <- replace(df0.full$Gene.Symbol, df0.full$Gene.Symbol == "", NA)
+
+df <- df0[complete.cases(df0$Gene.Symbol), ] #85 proteins with gene symbols
+df.full <- df0.full[complete.cases(df0.full$Gene.Symbol), ] #1074 proteins with gene symbols
+
+#If needed, can split the significant hits into up and downregulated proteins:
+df.up <- df[which(df$logFC > 0),] #42 genes
+df.down <- df[which(df$logFC < 0),] #43 genes
+
+#Create universe list of all tested gene IDs
+universe_gene_list <- df.full$Gene.Symbol
+
+#If gene list variable is not already a character, make it one:
+universe_gene_list1 <- as.character(universe_gene_list)
+
+# for downstream visualization, we want the log2 fold change 
+original_gene_list <- df$logFC
+
+# name the vector
+names(original_gene_list) <- df$Gene.Symbol
+
+# omit any NA values 
+gene_list<-na.omit(original_gene_list)
+
+# sort the list in decreasing order (required for clusterProfiler)
+gene_list = sort(gene_list, decreasing = TRUE)
+gene_list1 = names(gene_list)
+
+# If needed, pull out directional gene names as lists
+gene_list.up <- df.up$Gene.Symbol
+gene_list.down <- df.down$Gene.Symbol
+
+# omit any NA values 
+gene_list.up<-na.omit(gene_list.up)
+gene_list.down<-na.omit(gene_list.down)
+
+#View list to ensure it looks correct:
+gene_list.up
+gene_list1
+```
+
+```{r Run GO enrichment analysis}
+# Run GO enrichment analysis!
+#Run hypergeometric over-representation test:
+ego.full <- enrichGO(gene          = gene_list1,
+                   universe      = universe_gene_list1,
+                   OrgDb         = org.Rn.eg.db,
+                   keyType = "SYMBOL",
+                   ont           = "BP",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff  = 0.05) #Note: Must remove "readable=TRUE" for SYMBOL-based analysis.
+head(ego.full)
+ego.full
+
+## Can also use simplify to remove redundant GO terms
+ego.full.2 <- simplify(ego.full)
+#ego.full.3 <- simplify(ego.full, cutoff=0.5, by="p.adjust", select_fun=min) 
+#Note: This simplifies the categories even more!
+
+#View results of gene set enrichment analysis as data.frame:
+ego.full.result <- ego.full@result
+
+#Now filter by qvalue:
+ego.full.result.q <- ego.full.result[which(ego.full.result$qvalue<0.05),]
+#8 pathways enriched.
+
+#Write simplified results as csv:
+write.csv(ego.full.result.q, "/Users/jjkoch/Dropbox/Bernstein_Lab/Gloria_Rotation_Proteomics/A-C_GOenrich_allsigproteins_hypergeometric_Results_v1_030922.csv")
+```
+
+```{r Visualize pathway enrichment analysis results using a variety of plots}
+
+#Now visualize!
+dotplot(ego.full, x="count", showCategory=8, color='qvalue')
+
+library(stringr)
+
+dotplot <- dotplot(ego.full, x="count", showCategory=8, color='qvalue')
+dotplot2 <- dotplot + ggtitle("Significant Proteins") + theme(axis.text.y=element_text(size=9)) + scale_y_discrete(labels=function(x) str_wrap(x, width=30))
+dotplot2
+
+########################################################
+
+#Other data visualization tools:
+
+#EMAP network plot:
+ego.full.4 <- pairwise_termsim(ego.full) 
+emapplot(ego.full.4, showCategory = 8) #Can adjust category number.
+
+#CNET network plot
+cnetplot(ego.full.4, categorySize="geneNum", foldChange=gene_list, showCategory = 8)
+
+#CNET network plot with custom modifications & limited to top 5 categories
+c <- cnetplot(ego.full.4, categorySize="geneNum", foldChange=gene_list, showCategory = 8, cex_label_category=0.75)
+c + scale_colour_gradient2(name = "Fold change", low="blue", high="red") + scale_size_continuous(name = "Number of genes")
+
+#Goplot
+goplot(ego.full.4, showCategory=8)
+
+#heatplot
+heatplot(ego.full.4, foldChange=gene_list)
+
+### END OF PATHWAY ANALYSIS
+```
+
+```{r Optional: Can also run over-representation tests on seaparate lists of up or down-regulated protein IDs}
+#Can also run over-representation test on only up/down-regulated proteins:
+ego.up <- enrichGO(gene          = gene_list.up,
+                   universe      = universe_gene_list1,
+                   OrgDb         = org.Rn.eg.db,
+                   keyType = "SYMBOL",
+                   ont           = "BP",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff  = 0.05)
+head(ego.up)
+
+ego.down <- enrichGO(gene          = gene_list.down,
+                     universe      = universe_gene_list1,
+                     OrgDb         = org.Rn.eg.db,
+                     keyType = "SYMBOL",
+                     ont           = "BP",
+                     pAdjustMethod = "BH",
+                     pvalueCutoff  = 0.05)
+head(ego.down)
+
+```
+
