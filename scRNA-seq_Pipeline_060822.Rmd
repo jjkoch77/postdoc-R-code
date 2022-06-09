@@ -1,0 +1,240 @@
+---
+title: "scRNA-seq_Pipeline"
+author: "Joseph Kochmanski"
+date: '2022-06-09'
+output: html_document
+---
+#Using Seurat for single-cell RNA-sequencing data analysis
+#Adapted from example pipeline provided at: https://satijalab.org/seurat/articles/pbmc3k_tutorial.html
+#Additional tutorial for newer transform function (integrated below) available here: https://satijalab.org/seurat/articles/sctransform_vignette.html
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r install and load packages}
+install.packages('Seurat')
+install.packages('patchwork')
+library(dplyr)
+library(Seurat)
+library(patchwork)
+```
+
+```{r Read in the dataset}
+# Load the PBMC dataset (publicly available via 10X Genomics)
+pbmc.data <- Read10X(data.dir = "/Users/jjkoch/Dropbox/Bernstein_Lab/scRNA-seq_Pipeline/filtered_gene_bc_matrices/hg19/")
+# Initialize the Seurat object with the raw (non-normalized data).
+pbmc <- CreateSeuratObject(counts = pbmc.data, project = "pbmc3k", min.cells = 3, min.features = 200)
+pbmc
+```
+
+```{r Quick look at data matrix }
+# Lets examine a few genes in the first thirty cells
+pbmc.data[c("CD3D", "TCL1A", "MS4A1"), 1:30]
+#The . values in the matrix represent 0s (no molecules detected). Since most values in an scRNA-seq matrix are 0, Seurat uses a sparse-matrix representation whenever possible. This results in significant memory and speed savings for Drop-seq/inDrop/10x data.
+
+```
+
+```{r QC and selecting cells for further analysis }
+#Notes from tutorial: 
+#Seurat allows you to easily explore QC metrics and filter cells based on any user-defined criteria. A few QC metrics commonly used by the community include:
+#The number of unique genes detected in each cell.
+#Low-quality cells or empty droplets will often have very few genes
+#Cell doublets or multiplets may exhibit an aberrantly high gene count
+#Similarly, the total number of molecules detected within a cell (correlates strongly with unique genes)
+#The percentage of reads that map to the mitochondrial genome
+#Low-quality / dying cells often exhibit extensive mitochondrial contamination
+#It is possible to calculate mitochondrial QC metrics with the PercentageFeatureSet() function, which calculates the percentage of counts originating from a set of features
+#Then use the set of all genes starting with MT- as a set of mitochondrial genes
+
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+
+# Visualize QC metrics as a violin plot
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+```
+
+```{r Visualize the feature-feature relationships }
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+```
+
+```{r OLD code: Subset by selected QC parameters}
+pbmc <- subset(pbmc, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+#Note that these are default parameters and can be adjusted as needed.
+```
+
+```{r OLD code: Normalizing the data }
+#After removing unwanted cells from the dataset, the next step is to normalize the data. By default, we employ a global-scaling normalization method “LogNormalize” that normalizes the feature expression measurements for each cell by the total expression, multiplies this by a scale factor (10,000 by default), and log-transforms the result. Normalized values are stored in pbmc[["RNA"]]@data.
+
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize", scale.factor = 10000)
+#Again, these are default values and could be adjusted if desired.
+```
+
+```{r OLD code: Identification of highly variable features (feature selection) }
+# Next, calculate a subset of features that exhibit high cell-to-cell variation in the dataset (i.e, they are highly expressed in some cells, and lowly expressed in others).
+pbmc <- FindVariableFeatures(pbmc, selection.method = "vst", nfeatures = 2000)
+#By default, we return 2,000 features per dataset. These will be used in downstream analysis, like PCA.
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2
+```
+
+```{r OLD code: Scaling the data }
+#Next, we apply a linear transformation (‘scaling’) that is a standard pre-processing step prior to dimensional reduction techniques like PCA. The ScaleData() function:
+
+#Shifts the expression of each gene, so that the mean expression across cells is 0
+#Scales the expression of each gene, so that the variance across cells is 1
+#This step gives equal weight in downstream analyses, so that highly-expressed genes do not dominate
+#The results of this are stored in pbmc[["RNA"]]@scale.data
+all.genes <- rownames(pbmc)
+pbmc <- ScaleData(pbmc, features = all.genes)
+
+#Optional -- to make things faster:
+#Scaling is an essential step in the Seurat workflow, but only on genes that will be used as input to PCA. Therefore, the default in ScaleData() is only to perform scaling on the previously identified variable features (2,000 by default). To do this, omit the features argument in the previous function call, i.e.
+pbmc <- ScaleData(pbmc)
+#PCA and clustering results will be unaffected. However, Seurat heatmaps (produced as shown below with DoHeatmap()) require genes in the heatmap to be scaled, to make sure highly-expressed genes don’t dominate the heatmap. As such, if possible, run scaling on all genes.
+```
+
+```{r  NEWER Method: Apply sctransform normalization}
+#Note that this single command replaces NormalizeData(), ScaleData(), and FindVariableFeatures().
+#Transformed data will be available in the SCT assay, which is set as the default after running sctransform
+#During normalization, we can also remove confounding sources of variation, for example, mitochondrial mapping percentage
+
+# Old code: run sctransform
+#pbmc <- SCTransform(pbmc, vars.to.regress = "percent.mt", verbose = FALSE)
+
+#Alternatively, the latest version of sctransform also supports using glmGamPoi package which substantially improves the speed of the learning procedure. It can be invoked by specifying method="glmGamPoi".
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install("glmGamPoi")
+library(glmGamPoi)
+pbmc <- SCTransform(pbmc, method = "glmGamPoi", vars.to.regress = "percent.mt", verbose = FALSE)
+```
+
+```{r Perform dimensionality reduction by PCA and UMAP embedding }
+# These are now standard steps in the Seurat workflow for visualization and clustering
+pbmc <- RunPCA(pbmc, verbose = FALSE)
+pbmc <- RunUMAP(pbmc, dims = 1:30, verbose = FALSE)
+
+pbmc <- FindNeighbors(pbmc, dims = 1:30, verbose = FALSE)
+pbmc <- FindClusters(pbmc, verbose = FALSE)
+DimPlot(pbmc, label = TRUE) + NoLegend()
+
+#Notes from Seurat tutorial:
+#In the standard Seurat workflow we focus on 10 PCs for this dataset, though we highlight that the results are similar with higher settings #for this parameter. Interestingly, we’ve found that when using sctransform, we often benefit by pushing this parameter even higher. We #believe this is because the sctransform workflow performs more effective normalization, strongly removing technical effects from the data.
+
+#Even after standard log-normalization, variation in sequencing depth is still a confounding factor (see Figure 1), and this effect can #subtly influence higher PCs. In sctransform, this effect is substantially mitigated (see Figure 3). This means that higher PCs are more #likely to represent subtle, but biologically relevant, sources of heterogeneity – so including them may improve downstream analysis.
+
+#In addition, sctransform returns 3,000 variable features by default, instead of 2,000. The rationale is similar, the additional variable features are less likely to be driven by technical differences across cells, and instead may represent more subtle biological fluctuations. In general, we find that results produced with sctransform are less dependent on these parameters (indeed, we achieve nearly identical results when using all genes in the transcriptome, though this does reduce computational efficiency). This can help users generate more robust results, and in addition, enables the application of standard analysis pipelines with identical parameter settings that can quickly be applied to new datasets:
+
+#For example, the following code replicates the full end-to-end workflow, in a single command:
+
+pbmc <- CreateSeuratObject(pbmc_data) %>%
+    PercentageFeatureSet(pattern = "^MT-", col.name = "percent.mt") %>%
+    SCTransform(vars.to.regress = "percent.mt") %>%
+    RunPCA() %>%
+    FindNeighbors(dims = 1:30) %>%
+    RunUMAP(dims = 1:30) %>%
+    FindClusters()
+
+#More notes from tutorial:
+#As described in our paper, sctransform calculates a model of technical noise in scRNA-seq data using ‘regularized negative binomial regression’. The residuals for this model are normalized values, and can be positive or negative. Positive residuals for a given gene in a given cell indicate that we observed more UMIs than expected given the gene’s average expression in the population and cellular sequencing depth, while negative residuals indicate the converse.
+
+#The results of sctransfrom are stored in the “SCT” assay. You can learn more about multi-assay data and commands in Seurat in our vignette, command cheat sheet, or developer guide.
+```
+
+```{r Finding differentially expressed features (cluster biomarkers) }
+#Seurat can help you find markers that define clusters via differential expression. By default, it identifies positive and negative markers of a single cluster (specified in ident.1), compared to all other cells. 
+
+#The min.pct argument requires a feature to be detected at a minimum percentage in either of the two groups of cells, and the thresh.test argument requires a feature to be differentially expressed (on average) by some amount between the two groups. You can set both of these to 0, but with a dramatic increase in time - since this will test a large number of features that are unlikely to be highly discriminatory. As another option to speed up these computations, max.cells.per.ident can be set. This will downsample each identity class to have no more cells than whatever this is set to. 
+
+# find all markers of cluster 2
+cluster2.markers <- FindMarkers(pbmc, ident.1 = 2, min.pct = 0.25)
+head(cluster2.markers, n = 5)
+
+# find all markers distinguishing cluster 5 from clusters 0 and 3
+cluster5.markers <- FindMarkers(pbmc, ident.1 = 5, ident.2 = c(0, 3), min.pct = 0.25)
+head(cluster5.markers, n = 5)
+
+# find markers for every cluster compared to all remaining cells, report only the positive
+# ones
+pbmc.markers <- FindAllMarkers(pbmc, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+pbmc.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 2, order_by = avg_log2FC)
+
+#Seurat has several tests for differential expression which can be set with the test.use parameter (see DE vignette for details:https://satijalab.org/seurat/articles/de_vignette.html). For example, the ROC test returns the ‘classification power’ for any individual marker (ranging from 0 - random, to 1 - perfect).
+
+cluster0.markers <- FindMarkers(pbmc, ident.1 = 0, logfc.threshold = 0.25, test.use = "roc", only.pos = TRUE)
+
+#There are also several tools for visualizing marker expression. VlnPlot() (shows expression probability distributions across clusters), and FeaturePlot() (visualizes feature expression on a tSNE or PCA plot) are our most commonly used visualizations. We also suggest exploring RidgePlot(), CellScatter(), and DotPlot() as additional methods to view your dataset.
+
+VlnPlot(pbmc, features = c("MS4A1", "CD79A"))
+
+# you can plot raw counts (log scale) as well
+VlnPlot(pbmc, features = c("NKG7", "PF4"), slot = "counts", log = TRUE)
+```
+
+
+```{r Annotate clusters based on canonical markers }
+# These are now standard steps in the Seurat workflow for visualization and clustering
+# Visualize canonical marker genes as violin plots.
+VlnPlot(pbmc, features = c("CD8A", "GZMK", "CCL5", "S100A4", "ANXA1", "CCR7", "ISG15", "CD3D"),
+    pt.size = 0.2, ncol = 4)
+#Example interpretation:Clear separation of at least 3 CD8 T cell populations (naive, memory, effector), based on CD8A, CCL5, & GZMK expression
+```
+
+```{r Visualize canonical marker genes in feature plots }
+# Visualize canonical marker genes on the sctransform embedding.
+FeaturePlot(pbmc, features = c("CD8A", "GZMK", "CCL5", "S100A4", "ANXA1", "CCR7"), pt.size = 0.2,
+    ncol = 3)
+
+#Another example with different genes of interest:
+FeaturePlot(pbmc, features = c("CD3D", "ISG15", "TCL1A", "FCER2", "XCL1", "FCGR3A"), pt.size = 0.2,
+    ncol = 3)
+```
+
+
+```{r Heatmaps of expression }
+#DoHeatmap() generates an expression heatmap for given cells and features. In this case, we are plotting the top 20 markers (or all markers if less than 20) for each cluster.
+
+pbmc.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+DoHeatmap(pbmc, features = top10$gene) + NoLegend()
+```
+```{r Assigning cell type identity to clusters }
+#When known, can use canonical markers to easily match the unbiased clustering to known cell types
+#Cluster ID	Markers	Cell Type
+#0	IL7R, CCR7	Naive CD4+ T
+#1	CD14, LYZ	CD14+ Mono
+#2	IL7R, S100A4	Memory CD4+
+#3	MS4A1	B
+#4	CD8A	CD8+ T
+#5	FCGR3A, MS4A7	FCGR3A+ Mono
+#6	GNLY, NKG7	NK
+#7	FCER1A, CST3	DC
+#8	PPBP	Platelet
+new.cluster.ids <- c("Naive CD4 T", "CD14+ Mono", "Memory CD4 T", "B", "CD8 T", "FCGR3A+ Mono",
+    "NK", "DC", "Platelet", "Unknown","Unknown","Unknown")
+names(new.cluster.ids) <- levels(pbmc)
+pbmc <- RenameIdents(pbmc, new.cluster.ids)
+DimPlot(pbmc, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+```
+
+```{r Save data as Rdata file }
+saveRDS(pbmc, file = "/Users/jjkoch/Dropbox/Bernstein_Lab/scRNA-seq_Pipeline/filtered_gene_bc_matrices/hg19/output/pbmc3k_final.rds")
+```
+
+```{r  }
+
+```
